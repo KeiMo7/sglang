@@ -46,6 +46,13 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.cache_audit import (
+    CacheEvictError,
+    EvictRound,
+    HitLedger,
+    StopReason,
+    namespace_of,
+)
 from sglang.srt.mem_cache.events import KVCacheEventRecorder, LoRANameTable
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
@@ -287,6 +294,7 @@ class RadixCache(BasePrefixCache):
         self.page_size = params.page_size
         self.is_eagle = params.is_eagle
         self.eviction_policy = params.eviction_policy.lower()
+        self.hit_ledger = HitLedger(capacity=params.hit_ledger_capacity)
 
         # A disabled tree holds nothing, so it reports no KV events and never
         # evicts; its eviction policy config is not built or validated.
@@ -330,6 +338,7 @@ class RadixCache(BasePrefixCache):
         enable_kv_cache_events: bool = False,
         dynamo_kv_event_format: bool = False,
         kv_event_lora_names: Optional[LoRANameTable] = None,
+        hit_ledger_capacity: int = 1024,
     ) -> RadixCache:
         """Init a radix cache without memory pools for simulation purpose."""
         params = CacheInitParams(
@@ -340,6 +349,7 @@ class RadixCache(BasePrefixCache):
             enable_kv_cache_events=enable_kv_cache_events,
             dynamo_kv_event_format=dynamo_kv_event_format,
             kv_event_lora_names=kv_event_lora_names,
+            hit_ledger_capacity=hit_ledger_capacity,
         )
         return RadixCache(params)
 
@@ -355,6 +365,7 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self.evictable_leaves.clear()
+        self.hit_ledger.clear()
         self._empty_device_indices = torch.empty(
             (0,), dtype=torch.int64, device=self.device
         )
@@ -413,13 +424,30 @@ class RadixCache(BasePrefixCache):
         if len(key) == 0:
             return self._empty_match_result
 
-        value, last_node = self._match_prefix_helper(self.root_node, key)
-        return MatchResult(
+        lookup_tokens = len(key)
+        split_count = [0]
+        value, last_node = self._match_prefix_helper(
+            self.root_node, key, split_count
+        )
+        result = MatchResult(
             device_prefix_len=sum(len(v) for v in value),
             last_device_node=last_node,
             last_host_node=last_node,
             best_match_node=last_node,
         )
+        # Record only after the match has fully succeeded so a raising match
+        # leaves no half-entry in the ledger.
+        self.hit_ledger.record(
+            namespace=namespace_of(
+                params.key.extra_key, params.key.cache_salt
+            ),
+            lookup_tokens=lookup_tokens,
+            matched_tokens=result.device_prefix_len,
+            page_size=self.page_size,
+            splits=split_count[0],
+            last_node_id=result.last_device_node.id,
+        )
+        return result
 
     def touch_prefix(self, key: RadixKey) -> None:
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
@@ -556,35 +584,231 @@ class RadixCache(BasePrefixCache):
     def total_size(self):
         return self._total_size_helper()
 
+    def take_hit_records(self):
+        return self.hit_ledger.take()
+
+    def hit_stats(self):
+        return self.hit_ledger.stats
+
+    def hit_rate(self) -> float:
+        return self.hit_ledger.overall.hit_rate
+
     def evict(self, params: EvictParams) -> EvictResult:
+        round_report = self.evict_round(params.num_tokens)
+        return EvictResult(num_tokens_evicted=round_report.evicted)
+
+    def evict_round(self, num_tokens: int) -> EvictRound:
+        """Run one deterministic eviction round and return its full account.
+
+        Heap entries are ``(priority, node.id, node)`` so equal priorities
+        break by ascending node id instead of set iteration order.  Each
+        victim's allocator segment is freed before the node is detached.
+        Allocator failures are wrapped in :class:`CacheEvictError` carrying
+        the completed prefix of the round.
+        """
+        if num_tokens < 0:
+            raise ValueError(f"num_tokens must be >= 0, got {num_tokens}")
+
+        disabled_round = EvictRound(
+            requested=num_tokens,
+            evicted=0,
+            shortfall=num_tokens,
+            victims=(),
+            by_namespace={},
+            reason=StopReason.DISABLED,
+            allocator_calls=0,
+        )
         if self.disable:
-            return EvictResult()
+            return disabled_round
 
         start_time = time.perf_counter()
-        num_tokens = params.num_tokens
-        leaves = list(self.evictable_leaves)
-        eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
-        ]
-        heapq.heapify(eviction_heap)
+        allocator = self.token_to_kv_pool_allocator
+        strategy = self.eviction_strategy
 
-        num_evicted = 0
-        while num_evicted < num_tokens and len(eviction_heap):
-            _priority, x = heapq.heappop(eviction_heap)
+        evicted = 0
+        allocator_calls = 0
+        victim_ids: List[int] = []
+        by_namespace: dict = defaultdict(int)
 
-            # Tree values are page-aligned copies of a kv row: page-exact segment.
-            self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
-            num_evicted += len(x.value)
-            self._delete_leaf(x)
+        try:
+            eviction_heap = [
+                (strategy.get_priority(node), node.id, node)
+                for node in list(self.evictable_leaves)
+            ]
+            heapq.heapify(eviction_heap)
 
-            if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
-                new_priority = self.eviction_strategy.get_priority(x.parent)
-                heapq.heappush(eviction_heap, (new_priority, x.parent))
+            while evicted < num_tokens and len(eviction_heap):
+                _priority, _node_id, x = heapq.heappop(eviction_heap)
 
-            self.kv_events.record_remove(x)
+                # A concurrent/structural change may have invalidated the heap
+                # entry; such a node is skipped without touching accounting.
+                if (
+                    x not in self.evictable_leaves
+                    or x.value is None
+                    or x.lock_ref > 0
+                ):
+                    continue
 
-        self.update_eviction_metrics(num_evicted, start_time)
-        return EvictResult(num_tokens_evicted=num_evicted)
+                node_tokens = len(x.value)
+                try:
+                    if allocator is not None:
+                        # Tree values are page-aligned kv-row copies: page-exact.
+                        allocator.free_segment(x.value, start_pos=0)
+                except Exception as exc:
+                    report = self._build_evict_round(
+                        num_tokens,
+                        evicted,
+                        victim_ids,
+                        by_namespace,
+                        StopReason.EXHAUSTED,
+                        allocator_calls,
+                    )
+                    self._log_evict_round(report)
+                    raise CacheEvictError(
+                        node_id=x.id, tokens=node_tokens, report=report
+                    ) from exc
+
+                # Count only completed frees so len(victims)==allocator_calls
+                # on every allocator-present round.
+                if allocator is not None:
+                    allocator_calls += 1
+                evicted += node_tokens
+                victim_ids.append(x.id)
+                namespace = namespace_of(x.key.extra_key, x.key.cache_salt)
+                by_namespace[namespace] += node_tokens
+
+                # Free happened before detachment; _delete_leaf already calls
+                # _update_leaf_status(x.parent) under the parent's new state.
+                self._delete_leaf(x)
+
+                parent = x.parent
+                if parent is not None and parent in self.evictable_leaves:
+                    heapq.heappush(
+                        eviction_heap,
+                        (
+                            strategy.get_priority(parent),
+                            parent.id,
+                            parent,
+                        ),
+                    )
+
+                self.kv_events.record_remove(x)
+
+            reason = (
+                StopReason.TARGET_MET
+                if evicted >= num_tokens
+                else StopReason.EXHAUSTED
+            )
+            report = self._build_evict_round(
+                num_tokens,
+                evicted,
+                victim_ids,
+                by_namespace,
+                reason,
+                allocator_calls,
+            )
+            self._log_evict_round(report)
+            return report
+        finally:
+            # Fires exactly once per round, including the allocator-error path.
+            self.update_eviction_metrics(evicted, start_time)
+
+    @staticmethod
+    def _build_evict_round(
+        requested: int,
+        evicted: int,
+        victim_ids: List[int],
+        by_namespace: "defaultdict",
+        reason: StopReason,
+        allocator_calls: int,
+    ) -> EvictRound:
+        return EvictRound(
+            requested=requested,
+            evicted=evicted,
+            shortfall=max(0, requested - evicted),
+            victims=tuple(victim_ids),
+            by_namespace=dict(by_namespace),
+            reason=reason,
+            allocator_calls=allocator_calls,
+        )
+
+    @staticmethod
+    def _log_evict_round(report: EvictRound) -> None:
+        logger.info(
+            "radix-evict: requested=%d evicted=%d shortfall=%d reason=%s",
+            report.requested,
+            report.evicted,
+            report.shortfall,
+            report.reason.name,
+        )
+
+    def check_invariants(self) -> None:
+        """Validate size accounting, key/value lengths and the leaf set.
+
+        Every tree walk uses an explicit stack/container so a depth-thousands
+        chain cannot trigger :class:`RecursionError`.
+        """
+        all_nodes: List[TreeNode] = []
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            all_nodes.append(node)
+            stack.extend(node.children.values())
+
+        for node in all_nodes:
+            if node.value is not None and len(node.key) != len(node.value):
+                raise AssertionError(
+                    "radix invariant len(key) == len(value) failed at node "
+                    f"{node.id}: len(key)={len(node.key)} "
+                    f"len(value)={len(node.value)}"
+                )
+
+        expected_leaves = set()
+        for node in all_nodes:
+            if node.value is None or node.lock_ref != 0:
+                continue
+            has_value_child = any(
+                child.value is not None for child in node.children.values()
+            )
+            if not has_value_child:
+                expected_leaves.add(node)
+
+        actual_leaves = set(self.evictable_leaves)
+        if actual_leaves != expected_leaves:
+            problems = []
+            for node in sorted(
+                expected_leaves - actual_leaves, key=lambda n: n.id
+            ):
+                problems.append(
+                    f"node {node.id} should be an evictable leaf "
+                    f"(key_len={len(node.key)}, lock_ref={node.lock_ref}) "
+                    "but is absent from evictable_leaves"
+                )
+            for node in sorted(
+                actual_leaves - expected_leaves, key=lambda n: n.id
+            ):
+                problems.append(
+                    f"node {node.id} is in evictable_leaves but is not a leaf "
+                    f"(key_len={len(node.key)}, lock_ref={node.lock_ref}, "
+                    f"value_none={node.value is None}, "
+                    f"value_children="
+                    f"{[c.id for c in node.children.values() if c.value is not None]})"
+                )
+            raise AssertionError(
+                "radix invariant evictable_leaves mismatch: "
+                + "; ".join(problems)
+            )
+
+        evictable = self.evictable_size()
+        protected = self.protected_size()
+        total = self.total_size()
+        if evictable + protected != total:
+            raise AssertionError(
+                "radix invariant evictable_size + protected_size == "
+                f"total_size failed at root {self.root_node.id}: "
+                f"evictable_size={evictable}, protected_size={protected}, "
+                f"sum={evictable + protected}, total_size={total}"
+            )
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
@@ -634,13 +858,16 @@ class RadixCache(BasePrefixCache):
 
     def all_values_flatten(self):
         values = []
-
-        def _dfs_helper(node: TreeNode):
-            for _, child in node.children.items():
-                values.append(child.value)
-                _dfs_helper(child)
-
-        _dfs_helper(self.root_node)
+        # Iterative pre-order DFS; push children in reverse so dict order is
+        # preserved and depth-thousands chains never recurse.
+        stack = []
+        for child in reversed(list(self.root_node.children.values())):
+            stack.append(child)
+        while stack:
+            current_node = stack.pop()
+            values.append(current_node.value)
+            for child in reversed(list(current_node.children.values())):
+                stack.append(child)
         return torch.cat(values)
 
     ##### Internal Helper Functions #####
@@ -655,7 +882,12 @@ class RadixCache(BasePrefixCache):
         values.reverse()
         return torch.cat(values)
 
-    def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
+    def _match_prefix_helper(
+        self,
+        node: TreeNode,
+        key: RadixKey,
+        split_count: Optional[List[int]] = None,
+    ):
         access_time = time.monotonic()
         node.last_access_time = access_time
 
@@ -668,6 +900,8 @@ class RadixCache(BasePrefixCache):
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
+                if split_count is not None:
+                    split_count[0] += 1
                 value.append(new_node.value)
                 node = new_node
                 break

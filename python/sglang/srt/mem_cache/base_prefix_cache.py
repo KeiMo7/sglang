@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.kv_hints import KvHintsEnvelope
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+    from sglang.srt.mem_cache.cache_audit import HitLedger, HitRecord
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
     from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -489,6 +490,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
+    # Set by caches that keep a HitLedger; None (the class default) means the
+    # cache publishes no hit/eviction audit and take_hit_records returns ().
+    hit_ledger: Optional[HitLedger] = None
 
     def init_metrics_collector(self):
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -848,6 +852,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def take_events(self):
         return [] if self.kv_events is None else self.kv_events.take()
+
+    def take_hit_records(self) -> Tuple[HitRecord, ...]:
+        """Drain retained hit records; caches without a ledger return ``()``."""
+        if self.hit_ledger is None:
+            return ()
+        return self.hit_ledger.take()
 
     def supports_swa(self) -> bool:
         return False

@@ -76,6 +76,9 @@ class CacheInitParams:
     sidecar_draft_device_pools: tuple[object, ...] = ()
     mtp_draft_mamba_pools: tuple[object, ...] = ()
 
+    # Bounded detail ring for HitLedger; 0 keeps namespace aggregates only.
+    hit_ledger_capacity: int = 1024
+
     @property
     def tree_components(self) -> Optional[tuple[ComponentType, ...]]:
         """The tree slots' ids, in drive order."""
